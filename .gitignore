@@ -1,0 +1,7 @@
+# Local settings (may contain stats secrets)
+config.env
+
+# Downloaded binary, chain data and logs
+bin/
+data/
+logs/
