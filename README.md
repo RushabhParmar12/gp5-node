@@ -89,19 +89,3 @@ ssh -N -L 8545:127.0.0.1:8545 user@your-server
 ```
 
 Then use `http://localhost:8545` (chain ID 51 for Apothem) in curl, scripts or MetaMask.
-
-## Known issues
-
-- **Reset to genesis with `STATE_SCHEME=hash`:** after an unclean shutdown (crash, `docker kill`, OOM, power loss) during fast sync, the node can rewind past the 90k-block limit and restart from block 0. Use `path` (the default here) and always stop with `./gp5.sh stop`.
-- **`downloaded geth will not run on this platform`** from the official installer on Ubuntu 22.04 is the glibc 2.38 requirement. This script avoids it by using a container.
-
-## Reporting a bug
-
-Include the output of:
-
-```bash
-./gp5.sh status
-./gp5.sh logs --errors
-./gp5.sh logs --save        # attach the saved file
-grep -v '^#' config.env | grep -v '^$'   # remove any secrets first
-```
