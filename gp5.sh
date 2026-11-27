@@ -32,6 +32,7 @@ load_config() {
   RPC_APIS="${RPC_APIS:-eth,net,web3,txpool,XDPoS}"
   STOP_TIMEOUT="${STOP_TIMEOUT:-300}"; RUNTIME_IMAGE="${RUNTIME_IMAGE:-ubuntu:24.04}"
   ETHSTATS="${ETHSTATS:-}"; EXTRA_FLAGS="${EXTRA_FLAGS:-}"
+  VALIDATOR="${VALIDATOR:-false}"; COINBASE="${COINBASE:-}"
   CONTAINER="gp5-${NETWORK}"
   RPC_URL="http://127.0.0.1:${RPC_PORT}"
   case "$NETWORK" in
@@ -43,6 +44,16 @@ load_config() {
 
 is_running() { docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; }
 exists()     { docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; }
+
+set_config() { # set_config KEY VALUE  -> update or append in config.env
+  if grep -q "^$1=" "$CONFIG"; then sed -i "s|^$1=.*|$1=$2|" "$CONFIG"
+  else printf '%s=%s\n' "$1" "$2" >> "$CONFIG"; fi
+}
+keystore_addr() { # first account in data/keystore, as 0x...
+  local f; f=$(ls "$DATA/keystore"/UTC--* 2>/dev/null | head -1)
+  [ -n "$f" ] && echo "0x${f##*--}"
+}
+to_xdc() { echo "xdc${1#0x}"; }
 
 rpc() { # rpc method [params-json]
   curl -s -m 10 -X POST -H 'Content-Type: application/json' \
@@ -106,11 +117,23 @@ cmd_start() {
     --identity "$NODE_NAME" --port "$P2P_PORT"
     --http --http.addr "$RPC_ADDR" --http.port "$RPC_PORT" --http.api "$RPC_APIS")
   [ "$RPC_ADDR" != 127.0.0.1 ] && args+=(--http.vhosts '*')
-  [ -n "$ETHSTATS" ] && args+=(--ethstats "${NODE_NAME}:${ETHSTATS}")
+  if [ -n "$ETHSTATS" ]; then args+=(--ethstats "${NODE_NAME}:${ETHSTATS}")
+  else warn "ETHSTATS is empty - the node will not appear on the stats page"; fi
+  if [ "$VALIDATOR" = true ]; then
+    [ -n "$COINBASE" ] || die "VALIDATOR=true but COINBASE is empty. Run: ./gp5.sh account create"
+    local lc; lc=$(echo "${COINBASE#0x}" | tr 'A-F' 'a-f')
+    compgen -G "$DATA/keystore/UTC--*--$lc" >/dev/null || die "no keystore file for $COINBASE in data/keystore"
+    [ -s "$DATA/.password" ] || die "data/.password missing - needed to unlock $COINBASE"
+    [ "$RPC_ADDR" = 127.0.0.1 ] || die "VALIDATOR=true needs RPC_ADDR=127.0.0.1 (the key is unlocked; never expose RPC)"
+    args+=(--mine --unlock "$COINBASE" --password /data/.password --allow-insecure-unlock)
+    if [[ "$EXTRA_FLAGS" == *--mine* || "$EXTRA_FLAGS" == *--unlock* ]]; then
+      warn "EXTRA_FLAGS also has --mine/--unlock; remove them (VALIDATOR=true adds them)"
+    fi
+  fi
   # shellcheck disable=SC2206
   [ -n "$EXTRA_FLAGS" ] && args+=($EXTRA_FLAGS)
 
-  info "Starting $CONTAINER ($NETWORK, $SYNC_MODE sync, $STATE_SCHEME scheme) as '$NODE_NAME'"
+  info "Starting $CONTAINER ($NETWORK, $SYNC_MODE sync, $STATE_SCHEME scheme) as '$NODE_NAME'$([ "$VALIDATOR" = true ] && echo ", validator $(to_xdc "$COINBASE")")"
   docker run -d --name "$CONTAINER" --network host --restart unless-stopped \
     --stop-timeout "$STOP_TIMEOUT" \
     -v "$BIN:/usr/local/bin/geth:ro" -v "$DATA:/data" \
@@ -147,6 +170,22 @@ cmd_status() {
     [ "$hi" != - ] && [ "$hi" -gt 0 ] && echo "${B}Sync:${N}      $cur / $hi ($(awk "BEGIN{printf \"%.2f\", $cur*100/$hi}")%)"
   fi
   echo "${B}Disk:${N}      $(du -sh "$DATA" 2>/dev/null | cut -f1)"
+  if [ -z "$ETHSTATS" ]; then echo "${B}Stats:${N}     off (set ETHSTATS in config.env)"
+  else
+    local st; st=$(docker logs --since 10m "$CONTAINER" 2>&1 | grep -i "stats" | tail -1)
+    echo "${B}Stats:${N}     ${ETHSTATS#*@} as '$NODE_NAME'${st:+
+           last log: ${st:0:120}}"
+  fi
+  if [ "$VALIDATOR" != true ]; then echo "${B}Validator:${N} off"
+  else
+    local mn role="not elected (standby/candidate)"
+    mn=$(rpc XDPoS_getMasternodesByNumber '["latest"]')
+    if echo "$mn" | grep -qi "${COINBASE#0x}"; then role="${G}ACTIVE masternode${N}"
+    elif echo "$mn" | jq -e .error >/dev/null 2>&1; then role="unknown (check the masternode page)"; fi
+    echo "${B}Validator:${N} $(to_xdc "$COINBASE") - $role"
+    docker logs --since 1h "$CONTAINER" 2>&1 | grep -qi "HookPenalty.*${COINBASE#0x}" \
+      && echo "           ${R}PENALTY logged for this coinbase in the last hour - check ./gp5.sh logs --errors${N}"
+  fi
 }
 
 cmd_logs() {
@@ -202,6 +241,62 @@ cmd_compare() {
   load_config; RPC="$RPC_URL" "$ROOT/tools/compare.sh" "${1:-30}" "$RPC_URL"
 }
 
+cmd_account() {
+  load_config
+  case "${1:-show}" in
+    create)
+      local existing; existing=$(keystore_addr)
+      if [ -n "$existing" ]; then
+        warn "an account already exists: $existing ($(to_xdc "$existing"))"
+        set_config COINBASE "$existing"; ok "COINBASE set to it in config.env"; return
+      fi
+      mkdir -p "$DATA"
+      if [ ! -s "$DATA/.password" ]; then
+        (umask 077; head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DATA/.password"; echo >> "$DATA/.password")
+        ok "generated data/.password"
+      fi
+      info "Creating the node account (does not affect a running node)"
+      docker run --rm -v "$BIN:/usr/local/bin/geth:ro" -v "$DATA:/data" "$RUNTIME_IMAGE" \
+        geth account new --datadir /data --password /data/.password >/dev/null 2>&1 || die "account creation failed"
+      local addr; addr=$(keystore_addr); [ -n "$addr" ] || die "no keystore file was written"
+      set_config COINBASE "$addr"
+      ok "address: $addr"
+      ok "XDC format (use on the masternode page): $(to_xdc "$addr")"
+      echo "  Back it up now:  ./gp5.sh account backup"
+      echo "  Then propose it on the masternode page and run:  ./gp5.sh validator on" ;;
+    show)
+      local a; a=$(keystore_addr)
+      [ -n "$a" ] || { echo "No account yet. Create one with: ./gp5.sh account create"; return; }
+      echo "${B}Address:${N}   $a"
+      echo "${B}XDC:${N}       $(to_xdc "$a")"
+      echo "${B}Password:${N}  $([ -s "$DATA/.password" ] && echo "data/.password present" || echo "${R}data/.password missing${N}")"
+      echo "${B}COINBASE:${N}  ${COINBASE:-not set in config.env}" ;;
+    backup)
+      [ -n "$(keystore_addr)" ] || die "no account to back up"
+      mkdir -p "$ROOT/backups"
+      local f; f="$ROOT/backups/gp5-key-$(date +%Y%m%d-%H%M%S).tar.gz"
+      (umask 077; tar czf "$f" -C "$DATA" keystore .password) && ok "saved $f"
+      echo "  Copy it off this server, e.g. from your laptop:  scp root@<server-ip>:$f ." ;;
+    *) die "usage: ./gp5.sh account [create|show|backup]" ;;
+  esac
+}
+
+cmd_validator() {
+  load_config
+  case "${1:-}" in
+    on)
+      [ -n "$COINBASE" ] || COINBASE=$(keystore_addr)
+      [ -n "$COINBASE" ] || die "no account yet. Run: ./gp5.sh account create"
+      set_config COINBASE "$COINBASE"; set_config VALIDATOR true
+      ok "validator enabled for $(to_xdc "$COINBASE")"
+      is_running && { info "Restarting to apply"; cmd_stop; load_config; cmd_start; } ;;
+    off)
+      set_config VALIDATOR false; ok "validator disabled"
+      is_running && { info "Restarting to apply"; cmd_stop; load_config; cmd_start; } ;;
+    *) die "usage: ./gp5.sh validator on|off" ;;
+  esac
+}
+
 cmd_reset() {
   load_config
   echo "${R}This deletes all chain data in $DATA and resyncs from scratch.${N}"
@@ -227,6 +322,12 @@ ${B}Daily use${N}
   ./gp5.sh attach "eth.blockNumber"   run one console command
   ./gp5.sh rpc eth_blockNumber        raw JSON-RPC call
   ./gp5.sh stop | restart     clean stop (saves state) / restart
+
+${B}Masternode${N}
+  ./gp5.sh account create     create the node's coinbase address (+ password file)
+  ./gp5.sh account show       show the address in 0x and xdc format
+  ./gp5.sh account backup     save keystore + password to backups/
+  ./gp5.sh validator on|off   load the key and sign blocks when elected (restarts the node)
 
 ${B}Testing${N}
   ./gp5.sh speed [secs]       measure sync speed (blocks/s)
@@ -260,6 +361,8 @@ case "$CMD" in
   speed) cmd_speed "$@" ;;
   crashtest) cmd_crashtest ;;
   compare) cmd_compare "$@" ;;
+  account) cmd_account "$@" ;;
+  validator) cmd_validator "$@" ;;
   reset) cmd_reset ;;
   help|-h|--help) cmd_help ;;
   *) echo "Unknown command: $CMD"; echo; cmd_help; exit 1 ;;
